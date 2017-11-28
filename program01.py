@@ -6,14 +6,22 @@ ALMOST_ZERO = 1e-5
 
 class ProcInfo:
 	def __init__(self, pid, ops):
-		self.status = "ready"
-		self.pid    = pid
-		self.ops    = ops # Sarebbe code_io[]
+		self.pid = pid
+		self.ops = ops # Sarebbe code_io[]
 
 	def schifo(self):
-		"""Ritorna l'array dei tempi trasformando i -0.0 in 0.0"""
-		return [op if op > 0.0 else 0.0 for op in self.ops]
-	
+		"""Ritorna l'array dei tempi mappando a 0.0 i tempi negativi"""
+		return [max(0.0, op) for op in self.ops]
+
+
+class SchedulerState:
+	def __init__(self):
+		self.kill_running_process     = False
+		self.pause_running_process    = False
+		self.block_running_process    = False
+		self.handle_blocked_processes = False
+		self.run_new_process          = False
+
 
 class SchedulerSimulator:
 	def __init__(self, quantum, max_procs):
@@ -50,47 +58,62 @@ perchè vengono fatte su dispositivi diversi)."""
 		# Esegui finchè rimane tempo da avanzare
 		while delta_time > ALMOST_ZERO:
 			
-			# `state` rappresenta le azioni che lo scheduler deve
-			# compiere in base allo stato corrente della simulazione
-			state = self.get_scheduler_state()
+			# Il running va ucciso se gli rimane una sola operazione (che sara' di CPU) nella lista e quella operazione
+			# ha finito di fare il suo lavoro
+			if self.running_proc:
+				if len(self.running_proc.ops) == 1 and self.running_proc.ops[0] < ALMOST_ZERO:
+					self.kill_running_process() # Imposta running_proc a None
 			
-			if state.kill_running_process:
-				self.kill_running()
+			# Il running va messo in ready se non è stato ucciso e il quanto assegnatogli è scaduto
+			if self.running_proc:
+				if self.remaining_quantum < ALMOST_ZERO:
+					self.pause_running_process() # Imposta running_proc a None
 			
-			if state.pause_running_process:
-				self.ready(self.running_proc)
+			# Il running va bloccato se non è stato ucciso, non è stato messo ready, e se l'operazione corrente
+			# ha finito di fare il suo lavoro (cioè è arrivata a zero)
+			if self.running_proc:
+				if self.running_proc.ops[0] < ALMOST_ZERO:
+					self.block_running_process() # Imposta running_proc a None
 			
-			if state.block_running_process:
-				self.block(self.running_proc)
 			
-			
-			# NOTA: La gestione dei blocked avviene in TUTTI i casi in cui è necessario scegliere un nuovo processo running.
-			# Quindi è SEMPRE vero che state.handle_blocked_processes == state.run_new_process
-			# Sono separati solo per una questione concettuale
-			if state.handle_blocked_processes:
+			# I blocked vanno gestiti in TUTTI i casi in cui è necessario scegliere un nuovo processo running.
+			# Vedere il prossimo commento per le condizioni di selezione di un nuovo running.
+			if not self.running_proc:
 						
 				# Caso speciale per quando non restano processi ready (questa cosa non ha senso ma mi passare due test in più)
 				threshold = -ALMOST_ZERO if self.queue_ready else ALMOST_ZERO
+				# threshold = ALMOST_ZERO
 				
 				# Cicla su una copia dell'array dei blocked perchè durante il ciclo l'array può essere modificato
 				for blocked in self.queue_blocked[:]:
 					if blocked.ops[0] < threshold:
-						self.ready(blocked)
+						self.ready_blocked_process(blocked)
 			
 			
-			# Se bisogna mettere un nuovo processo in running è necessario controllare che ce ne sia almeno uno nei
-			# ready. Quando un nuovo running viene selezionato si resetta sempre il quanto assegnato al processo
-			# Questo succede se:
-			# - Non c'è un processo in running: succede all'inizio della simulazione o in casi particolari come per esempio
-			#   quando il vecchio running è stato bloccato/ucciso e non ce n'era uno immediatamente ready (in questo caso
-			#   il ciclo continua senza selezionare un running e si fa avanzare il tempo finchè un blocked non va in ready,
-			#   poi una successiva iterazione del ciclo avrà un ready a disposizione)
-			# - Il running è stato appena ucciso: bisogna selezionare un nuovo running
-			# - Il running è stato appena pausato: bisogna selezionare un nuovo running
-			# - Il running è stato appena bloccato: bisogna selezionare un nuovo running
-			if state.run_new_process:
-				if self.queue_ready:
-					self.run(self.queue_ready[0])
+			# Se si arriva a questo punto della simulazione e non c'è un running, bisogna sceglierne uno nuovo
+			# L'assenza di un running succede in 5 casi:
+			# 1) All'inizio della simulazione (running_proc viene inizializzato a None)
+			# 2) Il running è stato appena ucciso (running_proc viene impostato a None)
+			# 3) Il running è stato appena pausato (running_proc viene impostato a None)
+			# 4) Il running è stato appena bloccato (running_proc viene impostato a None)
+			# 5) Un ciclo precedente non è riuscito a trovare un running valido tra i ready
+			#    In questo caso la simulazione ha fatto avanzare il tempo finchè un blocked non finisce il suo tempo
+			#    di IO, che quindi sarà appena stato spostato nei ready, pronto per andare in running)
+			if not self.running_proc:
+				
+				# Si prende il processo in testa alla coda dei ready e lo si mette running.
+				# Può succedere che in una simulazione precedente il tempo di CPU di questo processo era arrivato
+				# "esattamente" a 0.0. Ciò non era sufficiente per bloccare il processo, ma se andasse in esecuzione
+				# adesso supererebbe subito lo zero, quindi lo si blocca.
+				# Questa operazione viene ripetuta finchè non si è trovato un running "valido" e rimangono dei
+				# candidati nella coda dei ready.
+				while not self.running_proc and self.queue_ready:
+					self.run_next_process()
+					if self.running_proc.ops[0] < ALMOST_ZERO:
+						self.block_running_process() # Imposta running_proc a None
+			
+				# Se è stato trovato un running "valido", si resetta il tempo assegnatogli
+				if self.running_proc:
 					self.remaining_quantum = self.quantum
 				
 			
@@ -123,7 +146,7 @@ perchè vengono fatte su dispositivi diversi)."""
 				timestep = min(delta_time, self.remaining_quantum, self.running_proc.ops[0])
 			else:
 				# La coda dei bloccati e' vuota oppure ogni operazione ha tempo maggiore di 0
-				assert not self.queue_blocked or [b.ops[0] for b in self.queue_blocked if b.ops[0] > ALMOST_ZERO]
+				assert not self.queue_blocked or not [b for b in self.queue_blocked if b.ops[0] < ALMOST_ZERO]
 				
 				# Se non c'era un processo running bisogna avanzare il tempo finchè uno dei blocked non torna ready
 				# Quindi scegliamo il tempo da avanzare tra:
@@ -142,6 +165,7 @@ perchè vengono fatte su dispositivi diversi)."""
 			
 			
 			# Avanza il tempo aggiornando i contatori dei processi
+			assert timestep > 0, "SchedulerSimulator.advance_time(): timestep = 0"
 			if self.running_proc:				
 				self.running_proc.ops[0] -= timestep
 			for blocked in self.queue_blocked:
@@ -155,7 +179,7 @@ perchè vengono fatte su dispositivi diversi)."""
 			
 			# Aggiorna preaker in modo da spaccare cicli infiniti
 			breaker -= 1
-			assert breaker > 0, "Infinite loop"
+			assert breaker > 0, "SchedulerSimulator.advance_time(): Infinite loop"
 
 	
 	def add_proc(self, code_io):
@@ -257,58 +281,59 @@ in esecuzione, allora deve tornare None."""
 		return state
 	
 	
-	def kill_running(self):
+	def kill_running_process(self):
 		"""Rilascia il PID assegnato al processo running e imposta che non
-c'e' un running. Causa errore se non c'e' un running."""
-		assert self.running_proc
+c'e' un running.
+Causa errore se non c'e' un running o se non ha terminato l'esecuzione."""
+		assert self.running_proc, "SchedulerSimulator.kill_running_process(): There is no running process"
+		assert len(self.running_proc.ops) == 1, "SchedulerSimulator.kill_running_process(): Running process still has operations"
+		assert self.running_proc.ops[0] <= ALMOST_ZERO, "SchedulerSimulator.kill_running_process(): Running process has not finished yet"
+		
 		self.free_pids.append(self.running_proc.pid)
 		self.running_proc = None
 	
 	
-	def block(self, proc):
-		"""Puo' essere chiamata solo con il processo running come argomento.
-Assume che il tempo di CPU in testa alla lista di operazioni sia scaduto,
-quindi lo rimuove dalla lista e poi sposta il processo in blocked"""
-		assert proc.status == "running"
+	def pause_running_process(self):
+		"""Sposta il processo running nella coda dei ready.
+Causa errore se non c'e' un running o se il tempo assegnatogli non e'
+scaduto."""
+		assert self.running_proc, "SchedulerSimulator.pause_running_process(): There is no running process"
+		assert self.remaining_quantum < ALMOST_ZERO, "SchedulerSimulator.pause_running_process(): Quantum has not expired yet"
 		
+		self.queue_ready.append(self.running_proc)
 		self.running_proc = None
+	
+	
+	def block_running_process(self):
+		"""Sposta il processo running nella coda dei blocked, rimuovendo
+il tempo di CPU in testa alla sua lista di operazioni.
+Causa errore se non c'e' un running o se il tempo di CPU in testa alla
+lista non e' scaduto."""
+		assert self.running_proc, "SchedulerSimulator.block_running_process(): There is no running process"
+		assert self.running_proc.ops[0] < ALMOST_ZERO, "SchedulerSimulator.block_running_process(): Running process has not finished yet"
+		
+		self.queue_blocked.append(self.running_proc)
+		self.running_proc.ops.pop(0)
+		self.running_proc = None
+	
+	
+	def ready_blocked_process(self, proc):
+		"""Sposta un processo dalla coda dei blocked nella coda dei ready,
+rimuovendo il tempo di IO in testa alla sua lista di operazioni.
+Causa errore se il processo non era nella coda dei blocked o se il tempo
+di IO in testa alla lista non e' scaduto."""
+		assert proc in self.queue_blocked, "SchedulerSimulator.ready_blocked_process(): Process is not blocked"
+		assert proc.ops[0] < ALMOST_ZERO, "SchedulerSimulator.ready_blocked_process(): Process has not finished yet"
+		
+		self.queue_blocked.remove(proc)
+		self.queue_ready.append(proc)
 		proc.ops.pop(0)
-		self.queue_blocked.append(proc)
-		proc.status = "blocked"
 	
 	
-	def ready(self, proc):
-		"""Sposta un processo nella coda dei ready.
-Se il processo era bloccato, assume che il tempo di attesa IO sia scaduto
-e quindi lo rimuove dalla lista delle operazioni"""
-		assert proc.status != "ready"
+	def run_next_process(self):
+		"""Imposta il processo in testa alla coda dei ready come running.
+Causa errore se c'e' gia' un running o se la coda dei ready e' vuota."""
+		assert not self.running_proc, "SchedulerSimulator.run_next_process(): There is already a running process"
+		assert len(self.queue_ready) > 0, "SchedulerSimulator.run_next_process(): There are no ready processes"
 		
-		if proc.status == "running":
-			self.running_proc = None
-			self.queue_ready.append(proc)
-			proc.status = "ready"
-		
-		if proc.status == "blocked":
-			self.queue_blocked.remove(proc)
-			proc.ops.pop(0)
-			self.queue_ready.append(proc)
-			proc.status = "ready"
-	
-	
-	def run(self, proc):
-		"""Imposta un processo come running.
-Causa errore se il processo non era ready
-"""
-		assert proc.status == "ready"
-		
-		self.queue_ready.remove(proc)
-		self.running_proc = proc
-		proc.status = "running"
-	
-class SchedulerState:
-	def __init__(self):
-		self.kill_running_process     = False
-		self.pause_running_process    = False
-		self.block_running_process    = False
-		self.handle_blocked_processes = False
-		self.run_new_process          = False
+		self.running_proc = self.queue_ready.pop(0)
